@@ -1,0 +1,58 @@
+{
+  "version": 2,
+  "project": "fixture-shop",
+  "database": "data/fixture-shop.db",
+  "user_agent": "skein-demo/0.3 (+https://skein.invalid/bot)",
+  "http": {
+    "read_timeout": 10,
+    "max_body_bytes": 5242880
+  },
+  "checkpoint": {
+    "fsync": "batch",
+    "snapshot_every": 200
+  },
+  "pipeline": {"write_batch": 32},
+  "workers": {"lease_ttl": 30, "heartbeat_interval": 5},
+  "dedup": {"near_duplicates": {"action": "skip_links"}},
+  "warc": {"max_size": 10485760},
+  "metrics": {"textfile": "data/fixture-shop.prom", "interval": 5},
+  "spiders": [
+    {
+      "name": "shop",
+      "seeds": ["http://127.0.0.1:8000/"],
+      "sitemaps": ["http://127.0.0.1:8000/sitemap_index.xml.gz"],
+      "max_depth": 4,
+      "concurrency": 4,
+      "politeness": {"min_delay": 0.2},
+      "retry": {"max_retries": 3, "backoff_base": 2, "backoff_max": 120},
+      "canonical": {"rules": 2, "tracking_params": ["ref"]},
+      "extract": {
+        "links": [
+          {"allow": ["/catalog\\?page=\\d+$"], "priority": 5},
+          {"allow": ["/product/\\d+$"]}
+        ],
+        "items": [
+          {
+            "name": "product",
+            "url_pattern": "/product/\\d+$",
+            "key": ["sku"],
+            "fields": {
+              "sku": {"selector": "#sku", "required": true},
+              "title": "h1[itemprop=name]",
+              "price": {"selector": ".price span", "type": "number"},
+              "currency": {"selector": ".price span", "regex": "^([^\\d\\s]+)"},
+              "in_stock": {"selector": ".stock", "type": "bool"},
+              "tags": {"selector": "ul.tags li", "multiple": true},
+              "image": {"selector": "img", "attr": "src", "type": "url"}
+            }
+          }
+        ]
+      },
+      "incremental": {
+        "mode": "auto",
+        "fingerprint_ignore": ["Generated at [^|]*"],
+        "revisit": {"initial_interval": 3600, "min_interval": 600, "max_interval": 604800}
+      }
+    }
+  ]
+}

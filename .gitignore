@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+.env
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Runtime state
+*.db
+*.db-wal
+*.db-shm
+*.bak
+*.checkpoints/
+*.sqlite
+*.sqlite3
+*.warc.gz
+data/
+var/
+exports/
+
+# Committed test fixtures (databases written by skein 0.1 and 0.2)
+!tests/data/
+!tests/data/v01_shop.db
+!tests/data/v02_shop.db
+
+# Credentials and local secrets
+*.key
+*.pem
+*.secret
+*.token
+.env.*
+secrets/
+credentials/

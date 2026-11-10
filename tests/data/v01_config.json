@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "project": "fixture-shop",
+  "database": "data/fixture-shop.db",
+  "user_agent": "skein-demo/0.1 (+https://skein.invalid/bot)",
+  "http": {
+    "read_timeout": 10,
+    "max_body_bytes": 5242880
+  },
+  "spiders": [
+    {
+      "name": "shop",
+      "seeds": ["http://127.0.0.1:8000/"],
+      "sitemaps": ["http://127.0.0.1:8000/sitemap_index.xml.gz"],
+      "max_depth": 4,
+      "min_delay": 0.2,
+      "concurrency": 4,
+      "remove_params": ["utm_*"],
+      "sort_query": true,
+      "links": [
+        {"allow": ["/catalog\\?page=\\d+$"], "priority": 5},
+        {"allow": ["/product/\\d+$"]}
+      ],
+      "items": [
+        {
+          "name": "product",
+          "url_pattern": "/product/\\d+$",
+          "key": ["sku"],
+          "fields": {
+            "sku": {"selector": "#sku", "required": true},
+            "title": "h1[itemprop=name]",
+            "price": {"selector": ".price span", "type": "number"},
+            "currency": {"selector": ".price span", "regex": "^([^\\d\\s]+)"},
+            "in_stock": {"selector": ".stock", "type": "bool"},
+            "tags": {"selector": "ul.tags li", "multiple": true},
+            "image": {"selector": "img", "attr": "src", "type": "url"}
+          }
+        }
+      ]
+    }
+  ]
+}
