@@ -22,6 +22,7 @@ from skein.store.migrations import Migration
 from skein.store.rekey import adopt_strict_rules
 from skein.store.schema_archive import ARCHIVE
 from skein.store.schema_history import to_item_history
+from skein.store.schema_sightings import add_item_sightings
 from skein.store.schema_workers import add_leases
 from skein.urls.parse import URLError, parse_url
 
@@ -339,5 +340,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(10, "dedup_archive", ARCHIVE, "SimHash band index, payload digests and WARC record locations"),
     Migration(11, "canonical_rules_v2", adopt_strict_rules,
               "URL keys recomputed with canonical rules version 2; colliding rows merged"),
+    Migration(12, "item_sightings", add_item_sightings,
+              "run-scoped sightings of authority fragment rules for deferred deletion reconciliation"),
 )
 LATEST_VERSION = MIGRATIONS[-1].version

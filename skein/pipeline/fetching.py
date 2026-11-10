@@ -278,7 +278,12 @@ class FetchStage:
         outcome = Outcome(request, tally, event=event)
         if failure.status in (404, 410) and request.kind is RequestKind.PAGE:
             # The page is gone, and with it every item it used to carry.
-            outcome.complete_types = tuple(r.name for r in ctx.extractor.rules if r.applies_to(request.url))
+            # Partial fragments never own a type's membership: their items are
+            # retired by the run-level authority reconciliation instead.
+            outcome.complete_types = tuple(
+                r.name for r in ctx.extractor.rules
+                if r.applies_to(request.url) and not r.partial
+            )
         if decision.action is RetryAction.RETRY:
             event.error = f"{failure.reason} (will retry)"
             request.attempts += 1

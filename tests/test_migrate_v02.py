@@ -72,7 +72,7 @@ def test_upgrade_recomputes_keys_and_merges_duplicates(v02: Path) -> None:
     versions_before = raw(v02, "SELECT rowid, item_key, version, content_hash, data, observed_at "
                                "FROM item_versions ORDER BY rowid")
     with Store(v02) as store:
-        assert [m.version for m in store.applied] == [8, 9, 10, 11]
+        assert [m.version for m in store.applied] == [8, 9, 10, 11, 12]
         assert store.backup_path is not None and store.backup_path.name == "legacy.db.schema-v7.bak"
         urls = {row[0].removeprefix(OLD_ORIGIN) for row in store.db.execute("SELECT url FROM frontier")}
         assert urls == {"/catalog?page=1", "/catalog?page=2", "/catalog?page=2&sort=price", "/tracked",

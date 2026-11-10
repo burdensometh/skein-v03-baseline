@@ -45,6 +45,12 @@ class ItemRule:
     when ``scope`` is ``None``). The item key joins the values of
     ``key_fields``; without key fields the page URL (plus the scope index when
     a page yields several items) is used.
+
+    A *partial* rule (``partial = True``) yields fragments of an item that
+    other rules of the same name complete on other pages: its fields are
+    merged field by field instead of replacing the stored record, it never
+    tombstones items itself, and (when ``authority = True``) its sightings
+    across a whole run decide which items are retired when the run ends.
     """
 
     name: str
@@ -52,6 +58,8 @@ class ItemRule:
     url_pattern: re.Pattern[str] | None = None
     scope: str | None = None
     key_fields: tuple[str, ...] = ()
+    partial: bool = False
+    authority: bool = False
 
     def applies_to(self, url: str) -> bool:
         return self.url_pattern is None or self.url_pattern.search(url) is not None

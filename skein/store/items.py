@@ -14,16 +14,28 @@ pages, loads the current rows of every affected item with a few queries,
 works out all version changes in memory (in page order, so an item seen on
 two pages of one batch is handled exactly as if the pages had been written
 one by one) and applies them with bulk statements.
+
+Partial fragment rules (``partial: true``) describe an item across several
+pages: each fragment only owns the fields its rule extracts, so fragments
+are merged field by field instead of replacing the record. A fragment never
+tombstones anything. A fragment rule marked ``authority: true`` additionally
+records one sighting per item per run in ``item_sightings``; when the run
+ends :meth:`ItemStore.reconcile_authority` tombstones exactly the items no
+authority page of that run carried -- items pushed onto later listing pages
+stay alive.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
 
-from skein.extract.extractor import ExtractedItem, content_hash
+from skein.extract.extractor import ExtractedItem, canonical_json, content_hash
+
+log = logging.getLogger(__name__)
 
 DELETED_HASH = "deleted"
 _CHUNK = 400
@@ -131,6 +143,7 @@ class ItemStore:
         current = self._load_current(pages)
         closed: list[tuple[float, int]] = []
         inserted: list[tuple[tuple[str, str, str], _Current]] = []
+        sightings: list[tuple[str, str, str, int, str, float, float]] = []
         results: list[ItemWrite] = []
         for page in pages:
             summary = ItemWrite()
@@ -142,9 +155,12 @@ class ItemStore:
             for item in page.items:
                 keep.add((item.item_type, item.key))
                 ident = (page.spider, item.item_type, item.key)
+                state = current.get(ident)
+                if item.partial:
+                    self._merge_fragment(ident, state, closed, inserted, current, page, item, sightings, summary)
+                    continue
                 payload = item.data_json()
                 digest = content_hash(payload)
-                state = current.get(ident)
                 if state is not None and state.content_hash == digest and not state.deleted:
                     state.last_seen = max(state.last_seen, page.observed_at)
                     state.url = item.url
@@ -164,8 +180,71 @@ class ItemStore:
                                 True)
                 summary.deleted += 1
             results.append(summary)
+        # Sightings join the same unit of work as the version writes, so a
+        # transaction wrapping write() keeps membership and content atomic.
+        self._record_sightings(sightings)
         self._flush(current, closed, inserted)
         return results
+
+    def _merge_fragment(
+        self,
+        ident: tuple[str, str, str],
+        state: _Current | None,
+        closed: list[tuple[float, int]],
+        inserted: list[tuple[tuple[str, str, str], _Current]],
+        current: dict[tuple[str, str, str], _Current],
+        page: PageItems,
+        item: ExtractedItem,
+        sightings: list[tuple[str, str, str, int, str, float, float]],
+        summary: ItemWrite,
+    ) -> None:
+        """Merge one partial fragment into the item, owning only its own fields."""
+        if item.authority and page.run_id is not None:
+            sightings.append((page.spider, item.item_type, item.key, page.run_id, page.url,
+                              page.observed_at, page.observed_at))
+        owned = {name: value for name, value in item.data.items() if name in item.field_names}
+        if state is None:
+            # The first fragment creates the record, even before any other page's
+            # fragment has arrived; later fragments fill in the missing fields.
+            payload = canonical_json(dict(owned))
+            summary.new += 1
+            self._supersede(ident, None, closed, inserted, current, page,
+                            payload, content_hash(payload), page.url, False)
+            return
+        existing = json.loads(state.data)
+        payload = canonical_json({**existing, **owned})
+        digest = content_hash(payload)
+        # Authority fragments come from listing pages; once a content page has
+        # given the record its URL, further fragments keep that URL. Before that,
+        # whichever fragment arrives first names the record's page.
+        url = state.url if state.url else page.url
+        if state.content_hash == digest and not state.deleted:
+            state.last_seen = max(state.last_seen, page.observed_at)
+            state.url = url
+            state.touched = True
+            summary.unchanged += 1
+            return
+        if state.deleted:
+            # A re-listed item comes back as a new version carrying every field
+            # still stored, with the fragment's values applied on top.
+            summary.new += 1
+        else:
+            summary.updated += 1
+        self._supersede(ident, state, closed, inserted, current, page, payload, digest, url, False)
+
+    def _record_sightings(self, sightings: list[tuple[str, str, str, int, str, float, float]]) -> None:
+        """Upsert this batch's authority sightings, one row per item per run."""
+        if not sightings:
+            return
+        self.db.executemany(
+            """INSERT INTO item_sightings (spider, item_type, item_key, run_id, url, first_seen, last_seen)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (spider, item_type, item_key, run_id) DO UPDATE SET
+                   last_seen = excluded.last_seen,
+                   url = CASE WHEN excluded.last_seen >= item_sightings.last_seen
+                              THEN excluded.url ELSE item_sightings.url END""",
+            sightings,
+        )
 
     def _supersede(
         self,
@@ -203,6 +282,12 @@ class ItemStore:
         current[ident] = replacement
 
     def _touch_page(self, page: PageItems, current: dict[tuple[str, str, str], _Current]) -> int:
+        touched = self._touch_by_url(page, current)
+        touched += self._touch_by_sighting(page)
+        return touched
+
+    def _touch_by_url(self, page: PageItems, current: dict[tuple[str, str, str], _Current]) -> int:
+        """Mark items whose stored URL is this page as seen (unchanged detail pages)."""
         touched = 0
         for ident, state in current.items():
             if ident[0] == page.spider and state.url == page.url and not state.deleted:
@@ -210,6 +295,78 @@ class ItemStore:
                 state.touched = True
                 touched += 1
         return touched
+
+    def _touch_by_sighting(self, page: PageItems) -> int:
+        """Mark the items an unchanged (304) authority page still lists as seen.
+
+        The items' stored URLs are their detail pages, not the listing, so the
+        membership held in ``item_sightings`` is what lets a 304 listing keep
+        every item on it fresh.
+        """
+        if page.run_id is None:
+            return 0
+        rows = self.db.execute(
+            """SELECT item_type, item_key FROM item_sightings
+               WHERE spider = ? AND run_id = ? AND url = ?""",
+            (page.spider, page.run_id, page.url),
+        ).fetchall()
+        touched = 0
+        for row in rows:
+            cursor = self.db.execute(
+                "UPDATE item_history SET last_seen = ? WHERE is_current = 1 AND spider = ? AND item_type = ? "
+                "AND item_key = ? AND deleted = 0 AND last_seen < ?",
+                (page.observed_at, page.spider, row["item_type"], row["item_key"], page.observed_at),
+            )
+            touched += cursor.rowcount
+        return touched
+
+    def reconcile_authority(self, spider: str, run_id: int, now: float) -> int:
+        """Tombstone live items no authority page of ``run_id`` sighted.
+
+        Run once when a run closes. Authority sightings cover every listing
+        page the run fetched, so an item merely pushed onto a later page still
+        has a sighting and is kept; only one missing from the whole listing is
+        retired. Returns the number of items tombstoned.
+        """
+        # Item types for which this run saw at least one authority fragment:
+        # their listing was crawled, so absence of a sighting means withdrawn.
+        types = [row["item_type"] for row in self.db.execute(
+            "SELECT DISTINCT item_type FROM item_sightings WHERE spider = ? AND run_id = ?",
+            (spider, run_id),
+        )]
+        retired = 0
+        for item_type in types:
+            rows = self.db.execute(
+                """SELECT h.id FROM item_history h
+                   WHERE h.is_current = 1 AND h.spider = ? AND h.item_type = ? AND h.deleted = 0
+                     AND NOT EXISTS (
+                         SELECT 1 FROM item_sightings s
+                         WHERE s.spider = h.spider AND s.item_type = h.item_type
+                           AND s.item_key = h.item_key AND s.run_id = ?)""",
+                (spider, item_type, run_id),
+            ).fetchall()
+            for row in rows:
+                self.db.execute(
+                    "UPDATE item_history SET valid_to = ?, is_current = 0 WHERE id = ?",
+                    (now, row["id"]),
+                )
+                self.db.execute(
+                    """INSERT INTO item_history (spider, item_type, item_key, version, content_hash, data, url,
+                                                 valid_from, is_current, deleted, first_seen, last_seen, run_id)
+                       SELECT spider, item_type, item_key, version + 1, ?, data, url, ?, 1, 1, first_seen, last_seen, ?
+                       FROM item_history WHERE id = ?""",
+                    (DELETED_HASH, now, run_id, row["id"]),
+                )
+                retired += 1
+        # The run's sightings have served their purpose; drop them so the table
+        # stays bounded by the in-flight runs instead of the crawl's history.
+        self.db.execute(
+            "DELETE FROM item_sightings WHERE spider = ? AND run_id = ?",
+            (spider, run_id),
+        )
+        if retired:
+            log.info("%s: authority reconciliation retired %d item(s) in run %d", spider, retired, run_id)
+        return retired
 
     def _load_current(self, pages: list[PageItems]) -> dict[tuple[str, str, str], _Current]:
         """Current rows of every item named by, or last seen on, one of the pages."""

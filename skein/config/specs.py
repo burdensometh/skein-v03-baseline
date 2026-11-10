@@ -14,7 +14,7 @@ from typing import Any
 
 from skein.checkpoint.journal import FsyncPolicy
 from skein.config.runtime import NEAR_DUPLICATE_ACTIONS
-from skein.config.schema import Anything, Bool, Field, HttpUrl, ListOf, MapOf, Number, Obj, RegexStr, SelectorStr, Str
+from skein.config.schema import Anything, Bool, Field, HttpUrl, INVALID, ListOf, MapOf, Number, Obj, RegexStr, SelectorStr, Str
 from skein.extract.rules import FIELD_SOURCES, FIELD_TYPES, TRANSFORMS
 from skein.incremental.modes import RunMode
 from skein.net.client import DEFAULT_USER_AGENT
@@ -35,11 +35,66 @@ def _field_checks(field: dict[str, Any]) -> list[tuple[str, str]]:
 
 
 def _item_checks(item: dict[str, Any]) -> list[tuple[str, str]]:
-    return [
+    problems = [
         ("key", f"key field {name!r} is not defined in fields")
         for name in item["key"]
         if name not in item["fields"]
     ]
+    if item["authority"] and not item["partial"]:
+        problems.append(("authority", "only applies to partial items (partial: true)"))
+    if item["partial"] and not item["key"]:
+        problems.append(("key", "partial items need explicit key fields so fragments from different pages merge"))
+    return problems
+
+
+def _item_group_checks(items: list[dict[str, Any]]) -> list[tuple[str, int, str, str]]:
+    """Cross-rule checks for item rules sharing a name (partial fragment groups).
+
+    Returns ``(item index, key, message)`` problems so the validator can name
+    the exact rule. Same-named rules must all be partial fragments of one item
+    type, own disjoint field sets, share their key fields, and leave at most
+    one rule holding deletion authority.
+    """
+    problems: list[tuple[str, int, str, str]] = []
+    groups: dict[str, list[int]] = {}
+    for index, item in enumerate(items):
+        groups.setdefault(item["name"], []).append(index)
+    for name, indices in groups.items():
+        if len(indices) == 1:
+            continue
+        rules = [items[i] for i in indices]
+        for index, rule in zip(indices, rules):
+            if not rule["partial"]:
+                problems.append(("partial", index, "",
+                                 f"item rule {name!r} shares its name with another rule; same-named rules must all "
+                                 "be partial fragments (partial: true)"))
+        partials = [rule for rule in rules if rule["partial"]]
+        if len(partials) != len(rules):
+            continue
+        key_sets = {tuple(rule["key"]) for rule in rules}
+        if len(key_sets) > 1:
+            for index in indices:
+                problems.append(("key", index, "",
+                                 f"partial rules sharing name {name!r} must use the same key fields"))
+        seen: dict[str, int] = {}
+        for index, rule in zip(indices, rules):
+            # Key fields are the join key and must appear in every fragment;
+            # they identify the record rather than own a content value.
+            for field_name in rule["fields"]:
+                if field_name in rule["key"]:
+                    continue
+                if field_name in seen:
+                    problems.append(("fields", index, field_name,
+                                     f"field {field_name!r} is owned by another {name!r} fragment rule; each field "
+                                     "must have a single owner"))
+                else:
+                    seen[field_name] = index
+        authorities = [index for index, rule in zip(indices, rules) if rule["authority"]]
+        if len(authorities) > 1:
+            for index in authorities:
+                problems.append(("authority", index, "",
+                                 f"at most one fragment rule of {name!r} may be the authority"))
+    return problems
 
 
 def _spider_checks(spider: dict[str, Any]) -> list[tuple[str, str]]:
@@ -85,6 +140,8 @@ ITEM_SPEC = Obj(
         "scope": Field(SelectorStr(non_empty=True), None),
         "key": Field(ListOf(Str(non_empty=True), unique=True), []),
         "fields": Field(MapOf(FIELD_SPEC, key_pattern=r"[A-Za-z_][A-Za-z0-9_]*", min_items=1)),
+        "partial": Field(Bool(), False),
+        "authority": Field(Bool(), False),
     },
     checks=(_item_checks,),
 )
@@ -155,6 +212,16 @@ CANONICAL_SPEC = Obj(
     checks=(_canonical_checks,),
 )
 
+def _extract_checks(extract: dict[str, Any]) -> list[tuple[str, str]]:
+    problems: list[tuple[str, str]] = []
+    items = extract["items"]
+    if any(any(value is INVALID for value in item.values()) for item in items):
+        return problems
+    for key, index, field_name, message in _item_group_checks(items):
+        problems.append((f"items[{index}].{field_name}" if field_name else f"items[{index}]", message))
+    return problems
+
+
 EXTRACT_SPEC = Obj(
     {
         "items": Field(ListOf(ITEM_SPEC), []),
@@ -162,7 +229,8 @@ EXTRACT_SPEC = Obj(
         "obey_nofollow": Field(Bool(), True),
         "obey_noindex": Field(Bool(), True),
         "deny_extensions": Field(ListOf(Str(pattern=r"\.?[A-Za-z0-9]+")), None),
-    }
+    },
+    checks=(_extract_checks,),
 )
 
 REVISIT_SPEC = Obj(

@@ -50,6 +50,8 @@ def analyse_page(
     suppresses item extraction; ``nofollow`` is applied by the link
     extractor. ``item_types`` lists the item rules that ran over the page,
     i.e. the types whose complete set of items on this page is known.
+    Partial fragment rules are left out: their items are reconciled across
+    the whole run instead of against a single page.
     With a ``simhasher`` the page's visible text also gets a SimHash.
     """
     if not response.is_html:
@@ -64,7 +66,10 @@ def analyse_page(
         analysis.simhash = simhasher.of_text(text)
     analysis.noindex = obey_noindex and "noindex" in directives
     if extractor.rules and not analysis.noindex:
-        analysis.item_types = tuple(rule.name for rule in extractor.rules if rule.applies_to(final_url))
+        analysis.item_types = tuple(
+            rule.name for rule in extractor.rules
+            if rule.applies_to(final_url) and not rule.partial
+        )
         result = extractor.extract(document, final_url)
         analysis.items = result.items
         analysis.dropped = result.dropped

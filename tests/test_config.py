@@ -152,3 +152,70 @@ def test_environment_expansion_in_groups() -> None:
     config = parse_config(data, env={"HOST": "shop.example"})
     assert config.checkpoint_root() == Path("/var/lib/skein")
     assert config.spider().seeds == ("https://shop.example/",)
+
+
+def _fragment_rules(**extra: object) -> dict[str, object]:
+    base = {
+        "version": 2,
+        "spiders": [{
+            "name": "gov",
+            "seeds": ["https://gov.example/notice/list"],
+            "extract": {"items": [
+                {"name": "notice", "url_pattern": "/notice/list", "partial": True, "authority": True,
+                 "key": ["doc_no"],
+                 "fields": {"doc_no": ".doc-no", "status": ".status", "updated": ".updated"}},
+                {"name": "notice", "url_pattern": "/notice/detail", "partial": True,
+                 "key": ["doc_no"],
+                 "fields": {"doc_no": ".doc-no", "body": ".body", "agency": ".agency"}},
+            ]},
+        }],
+    }
+    base["spiders"][0]["extract"]["items"][1].update(extra)  # type: ignore[index]
+    return base
+
+
+def test_partial_fragment_group_builds() -> None:
+    config = parse_config(_fragment_rules())
+    rules = config.spider().plan.items
+    assert [r.name for r in rules] == ["notice", "notice"]
+    assert rules[0].partial and rules[0].authority
+    assert rules[1].partial and not rules[1].authority
+
+
+def test_same_named_rules_must_all_be_partial() -> None:
+    data = _fragment_rules()
+    data["spiders"][0]["extract"]["items"][1]["partial"] = False  # type: ignore[index]
+    messages = issues_of(data)
+    assert any("partial fragments" in m for m in messages)
+
+
+def test_fragment_fields_must_have_one_owner() -> None:
+    data = _fragment_rules()
+    data["spiders"][0]["extract"]["items"][1]["fields"]["status"] = ".status"  # type: ignore[index]
+    messages = issues_of(data)
+    assert any("single owner" in m for m in messages)
+
+
+def test_only_one_authority_per_fragment_group() -> None:
+    data = _fragment_rules()
+    data["spiders"][0]["extract"]["items"][1]["authority"] = True  # type: ignore[index]
+    messages = issues_of(data)
+    assert any("at most one fragment rule" in m for m in messages)
+
+
+def test_authority_requires_partial() -> None:
+    data = {"version": 2, "spiders": [{
+        "name": "x", "seeds": ["https://x.example/"],
+        "extract": {"items": [{"name": "t", "authority": True,
+                                "fields": {"k": "h1"}}]}}]}
+    messages = issues_of(data)
+    assert any("authority" in m and "partial" in m for m in messages)
+
+
+def test_partial_requires_explicit_key() -> None:
+    data = {"version": 2, "spiders": [{
+        "name": "x", "seeds": ["https://x.example/"],
+        "extract": {"items": [{"name": "t", "partial": True,
+                                "fields": {"k": "h1"}}]}}]}
+    messages = issues_of(data)
+    assert any("explicit key fields" in m for m in messages)

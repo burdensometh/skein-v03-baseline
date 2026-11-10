@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Partial fragment item rules (`partial: true`): several same-named rules can
+  describe one item across pages (e.g. a listing with status and update date,
+  detail pages with body, agency and attachments). Fragments merge field by
+  field — each content field has a single owning rule, validated at load
+  time — so pages no longer overwrite each other, and a new item version is
+  written only when the merged content changes. A fragment that matches
+  nothing never clears another rule's fields.
+- `authority: true` on a fragment rule makes its pages the source of item
+  membership: per-run sightings are stored in the new `item_sightings`
+  table (schema version 12) and reconciled when the run closes, tombstoning
+  only items absent from every authority page. Items pushed onto later
+  listing pages are kept; partial rules never tombstone from a single page.
+  304 replies on authority pages still refresh the listed items' last-seen.
+- `skein extract` marks partial fragments with `partial`, `authority` and
+  their owned `fields`.
+
 ## 0.3.0
 
 Concurrency and distribution. Databases written by 0.1 and 0.2 are

@@ -280,14 +280,21 @@ def cmd_extract(args: argparse.Namespace, out: TextIO) -> int:
             raise ValueError(f"cannot fetch {args.url}: {exc}") from exc
     document = parse_html(html)
     result = Extractor(spider.plan.items).extract(document, url)
+    def item_report(i: object) -> dict[str, object]:
+        report = {"type": i.item_type, "key": i.key, "data": i.data, "hash": i.content_hash()}
+        if i.partial:
+            report["partial"] = True
+            report["authority"] = i.authority
+            report["fields"] = list(i.field_names)
+        return report
+
     report: dict[str, object] = {
         "url": url,
         "status": status,
         "charset": charset,
         "title": document.title,
         "fingerprint": spider.incremental.fingerprint.of_document(document),
-        "items": [{"type": i.item_type, "key": i.key, "data": i.data, "hash": i.content_hash()}
-                  for i in result.items],
+        "items": [item_report(i) for i in result.items],
         "dropped": result.dropped,
         "errors": result.errors,
     }

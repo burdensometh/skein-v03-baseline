@@ -54,6 +54,8 @@ def build_item(raw: dict[str, Any]) -> ItemRule:
         url_pattern=re.compile(raw["url_pattern"]) if raw["url_pattern"] else None,
         scope=raw["scope"],
         key_fields=tuple(raw["key"]),
+        partial=raw["partial"],
+        authority=raw["authority"],
     )
 
 

@@ -24,12 +24,22 @@ def content_hash(canonical: str) -> str:
 
 @dataclass
 class ExtractedItem:
-    """One structured record pulled from a page."""
+    """One structured record pulled from a page.
+
+    A partial extraction (``partial = True``) is a fragment of an item that
+    another page completes: ``field_names`` names exactly the fields this
+    fragment owns, so the store can merge it without touching fields owned by
+    other rules. ``authority`` marks the fragment whose sightings decide
+    deletions for this item type.
+    """
 
     item_type: str
     key: str
     data: dict[str, Any]
     url: str
+    partial: bool = False
+    authority: bool = False
+    field_names: tuple[str, ...] = ()
 
     def data_json(self) -> str:
         """Canonical JSON used for storage; its hash detects content changes."""
@@ -88,7 +98,20 @@ class Extractor:
                     result.dropped += 1
                     result.errors.append(f"{rule.name}[{index}] on {url}: key fields missing")
                     continue
-                result.items.append(ExtractedItem(rule.name, key, data, url))
+                if rule.partial:
+                    # Only fields the fragment actually carries take part in the
+                    # merge; a selector that matched nothing must not wipe fields
+                    # owned by the other page's rule. Key fields are always kept:
+                    # they identify the record even when absent from field_names.
+                    present = tuple(
+                        name for name in data
+                        if name in rule.key_fields or (data[name] is not None and data[name] != [])
+                    )
+                    result.items.append(ExtractedItem(
+                        rule.name, key, data, url, partial=True,
+                        authority=rule.authority, field_names=present))
+                else:
+                    result.items.append(ExtractedItem(rule.name, key, data, url))
         return result
 
     def _extract_fields(self, rule: ItemRule, scope: Element, url: str, errors: list[str]) -> dict[str, Any]:

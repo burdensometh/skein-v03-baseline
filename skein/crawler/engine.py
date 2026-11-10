@@ -577,6 +577,13 @@ class Crawler:
         completed = complete_watermarks(self.frontier, self.store, self.spider.name, self.roots, run["started_at"],
                                         session.run_id)
         result["run"] = dict(result.get("run") or {}, watermarks_completed=len(completed))
+        if status == "finished":
+            # The frontier is drained and every listing page was fetched; retire
+            # items the authority fragment rule no longer carries anywhere.
+            retired = self.store.items.reconcile_authority(self.spider.name, session.run_id, now)
+            if retired:
+                session.stats.items_deleted += retired
+                result.setdefault("items", {})["deleted"] = result.get("items", {}).get("deleted", 0) + retired
         self.store.runs.finish(session.run_id, now, status, result)
         return result
 

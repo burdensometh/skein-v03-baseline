@@ -129,6 +129,48 @@ selector string or an object with `selector`, `source` (`text`, `own_text`,
 `formats`, `multiple`, `join`, `required` and `default`. See
 `examples/fixture-shop.json`.
 
+### Items assembled from several pages (partial fragments)
+
+An item whose fields live on different pages — a listing carrying status and
+update date, detail pages carrying the body, issuing agency and attachments —
+is modelled with several item rules sharing one `name`, each marked
+`"partial": true`. Every fragment uses the same `key` fields and owns a
+disjoint set of content fields (validated at load time); skein merges the
+fragments field by field into one record instead of letting the pages replace
+each other, and writes a new version only when the merged content hash
+changes. A fragment whose selector matches nothing never wipes fields owned
+by another rule.
+
+One fragment rule may be marked `"authority": true`: it owns the item type's
+membership (typically the paginated listing). Its sightings across the whole
+run are collected in `item_sightings`, and when the run closes skein
+tombstones exactly the items no authority page carried anywhere in that run —
+an item pushed onto a later listing page keeps its record; only one withdrawn
+from the whole listing is deleted. Partial rules never take part in
+single-page tombstoning. A 304 on an authority page still refreshes the
+last-seen time of every item it lists.
+
+```json
+"items": [
+  {
+    "name": "notice", "url_pattern": "/notice/list", "scope": "li.notice",
+    "partial": true, "authority": true, "key": ["doc_no"],
+    "fields": {
+      "doc_no": {"selector": ".link", "source": "attr", "attr": "data-doc"},
+      "status": ".status", "updated": ".updated"
+    }
+  },
+  {
+    "name": "notice", "url_pattern": "/notice/detail",
+    "partial": true, "key": ["doc_no"],
+    "fields": {
+      "doc_no": ".doc-no", "body": ".body", "agency": ".agency",
+      "attachments": {"selector": ".attachment", "attr": "href", "type": "url", "multiple": true}
+    }
+  }
+]
+```
+
 Version-1 files (flat spider keys such as `min_delay`, `items`,
 `remove_params`, `retry_delay`, and a top-level `robots_ttl`) still load:
 they are translated to version 2 with a `ConfigDeprecationWarning` per
@@ -335,10 +377,11 @@ check and change counters are summed; duplicate links are merged; items
 are keyed by item key and only change their URL. Every rename is logged
 in `canonical_merges` (`skein db merges`).
 
-Tables: `runs`, `fetch_events`, `documents`, `item_history`, `frontier`,
-`watermarks`, `robots_cache`, `links`, `export_cursors`, `workers`,
-`host_state`, `host_slots`, `simhashes`, `simhash_bands`, `warc_files`,
-`canonical_rules`, `canonical_merges`, `skein_meta`.
+Tables: `runs`, `fetch_events`, `documents`, `item_history`,
+`item_sightings`, `frontier`, `watermarks`, `robots_cache`, `links`,
+`export_cursors`, `workers`, `host_state`, `host_slots`, `simhashes`,
+`simhash_bands`, `warc_files`, `canonical_rules`, `canonical_merges`,
+`skein_meta`.
 
 ## Library use
 
