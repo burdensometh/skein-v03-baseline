@@ -15,6 +15,8 @@ from skein.config import parse_config
 from skein.crawler import Crawler
 from skein.pipeline import StageQueue
 from skein.store import Store
+from skein.warc.cdx import build_index, database_lines
+from skein.warc.reader import WarcReader
 from tests.fixtures_site import FixtureSite
 from tests.helpers import PRODUCT_ITEMS, crawl, spider_spec
 
@@ -208,3 +210,50 @@ def test_global_concurrency_caps_requests_in_flight_across_processes(make_site, 
     observed.clear()
     run_crawl(site, tmp_path / "free.db", {}, patch=patch)
     assert max(observed) > 2, "without the cap all eight fetchers are busy"
+
+
+def test_a_retried_batch_leaves_no_orphan_warc_records(make_site, tmp_path: Path) -> None:  # noqa: ANN001
+    """A commit that fails after WARC bytes were appended rolls those bytes back too.
+
+    Before the fix the rolled-back exchange stayed in the .warc.gz while its
+    fetch event disappeared with the database transaction, so re-archiving on
+    retry produced several response records for one crawl, most of them with
+    no matching fetch event. Lock contention makes whole batches retry.
+    """
+    site = make_site(catalog_pages=3, products_per_page=6)
+    failures = {"left": 4}
+
+    def patch(crawler: Crawler) -> None:
+        writer_commit = crawler.store.transaction
+
+        def transaction() -> Any:
+            if failures["left"] and crawler.pipeline is not None and crawler.pipeline.writer.outcomes > 2:
+                failures["left"] -= 1
+                raise sqlite3.OperationalError("database is locked")
+            return writer_commit()
+
+        crawler.store.transaction = transaction  # type: ignore[method-assign]
+
+    db = tmp_path / "orphan.db"
+    result = run_crawl(site, db, {"warc": {"enabled": True}, "pipeline": {"write_batch": 4}}, patch=patch)
+    assert result.status == "finished" and result.stats["errors"] == {}
+    assert result.stats["pipeline"]["write"]["busy_retries"] >= 3, "the retried contention really happened"
+    with Store(db) as store:
+        registered_files = {row[0] for row in store.db.execute("SELECT name FROM warc_files")}
+    archive = tmp_path / "orphan.db.warc"
+    on_disk = sorted(p.name for p in archive.glob("*.warc.gz"))
+    assert on_disk and set(on_disk) == registered_files, "every archive file is registered (and vice versa)"
+    archived = build_index(archive.glob("*.warc.gz"))
+    # robots.txt exchanges are archived without a fetch event of their own.
+    page_captures = [line for line in archived if not line.original.endswith("robots.txt")]
+    with Store(db) as store:
+        archived_events = store.db.execute(
+            "SELECT COUNT(*) FROM fetch_events WHERE warc_file IS NOT NULL").fetchone()[0]
+        db_lines = list(database_lines(store.db))
+    # Every page response/revisit record on disk corresponds to a committed fetch event.
+    assert len(page_captures) == archived_events
+    disk_keys = {(line.filename, line.offset) for line in page_captures}
+    db_keys = {(line.filename, line.offset) for line in db_lines}
+    assert db_keys == disk_keys, "the archive and the fetch events point at the same records"
+    for path in archive.glob("*.warc.gz"):
+        assert WarcReader(path).truncated is None, "no half-written gzip member is left behind"

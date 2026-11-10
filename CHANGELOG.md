@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Multi-worker `--warc` crawls no longer leave the archive and the database
+  out of sync. The WARC writer now follows the writer's transaction
+  boundary: gzip members appended inside a database transaction are cut
+  back off the file when that transaction rolls back, so a retried batch
+  (for example under `database is locked` contention) can no longer leave
+  response records with no matching fetch event. Recovery at startup, and
+  when a dead peer is reaped, now also seals WARC files that have no
+  `warc_files` row (their registration was lost with a rolled-back
+  transaction) and files left open by a worker that never restarts with
+  the same id; torn final members are truncated and the files indexed.
+  Archives written by earlier versions are never modified and stay
+  replayable.
+
 ## 0.3.0
 
 Concurrency and distribution. Databases written by 0.1 and 0.2 are

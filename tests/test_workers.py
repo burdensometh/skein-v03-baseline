@@ -21,6 +21,8 @@ from skein.crawler import Crawler
 from skein.incremental.modes import RunMode
 from skein.workers.process import run_worker
 from skein.store import Store
+from skein.warc.cdx import build_index
+from skein.warc.reader import WarcReader
 from tests.fixtures_site import FixtureSite
 from tests.helpers import PRODUCT_ITEMS
 
@@ -110,6 +112,73 @@ def test_crawl_with_worker_processes_survives_a_sigkilled_worker(make_site, tmp_
             "done": 220}
         assert store.db.execute("SELECT COUNT(*) FROM host_slots WHERE owner IS NOT NULL").fetchone()[0] == 0
     assert not (tmp_path / "shop.db.checkpoints" / "shop" / "workers" / victim).exists()
+
+
+def test_sigkilled_worker_leaves_no_unsealed_warc(make_site, tmp_path: Path) -> None:  # noqa: ANN001
+    """A WARC-writing worker killed mid-crawl has its open file sealed when peers finish the run."""
+    site = make_site(catalog_pages=20, products_per_page=10, latency=0.08)
+    config = write_config(tmp_path, site, warc={"enabled": True})
+    db = tmp_path / "shop.db"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "skein", "-q", "crawl", str(config), "--workers", "2", "--stats", "json"],
+        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        victim, pid = find_victim(db, process, time.monotonic() + 60)
+        os.kill(pid, signal.SIGKILL)
+        stdout, stderr = process.communicate(timeout=120)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+    assert process.returncode == 0, stderr.decode()
+    archive = tmp_path / "shop.db.warc"
+    paths = sorted(archive.glob("*.warc.gz"))
+    assert paths
+    for path in paths:
+        assert WarcReader(path).truncated is None, f"{path.name} was not sealed after the SIGKILL"
+    with Store(db) as store:
+        open_rows = store.db.execute("SELECT name FROM warc_files WHERE closed_at IS NULL").fetchall()
+        registered = {row[0] for row in store.db.execute("SELECT name FROM warc_files")}
+    assert not open_rows, "every WARC file, including the killed worker's, is marked closed"
+    assert {p.name for p in paths} == registered
+    # The archive still matches the committed fetch events.
+    with Store(db) as store:
+        events = store.db.execute(
+            "SELECT COUNT(*) FROM fetch_events WHERE warc_file IS NOT NULL").fetchone()[0]
+        db_keys = {(row[0], row[1]) for row in store.db.execute(
+            "SELECT warc_file, warc_offset FROM fetch_events WHERE warc_file IS NOT NULL")}
+    page_captures = [line for line in build_index(paths) if not line.original.endswith("robots.txt")]
+    assert len(page_captures) == events
+    assert {(line.filename, line.offset) for line in page_captures} == db_keys
+
+
+def test_multi_worker_warc_archive_matches_the_database(make_site, tmp_path: Path) -> None:  # noqa: ANN001
+    """Several real worker processes archiving at once must stay consistent with the database."""
+    site = make_site(catalog_pages=12, products_per_page=10, latency=0.02)
+    config_path = write_config(tmp_path, site, warc={"enabled": True})
+    out = io.StringIO()
+    assert main(["-q", "crawl", str(config_path), "--workers", "3", "--stats", "json"], out=out) == 0
+    summary = json.loads(out.getvalue())
+    assert summary["status"] == "finished"
+    db = tmp_path / "shop.db"
+    archive = tmp_path / "shop.db.warc"
+    warc_paths = sorted(archive.glob("*.warc.gz"))
+    assert warc_paths, "the workers produced WARC files"
+    for path in warc_paths:
+        assert WarcReader(path).truncated is None, f"{path.name} has no half-written tail"
+    with Store(db) as store:
+        registered = {row[0] for row in store.db.execute("SELECT name FROM warc_files")}
+        open_files = store.db.execute("SELECT COUNT(*) FROM warc_files WHERE closed_at IS NULL").fetchone()[0]
+        events = store.db.execute(
+            "SELECT COUNT(*) FROM fetch_events WHERE warc_file IS NOT NULL").fetchone()[0]
+        db_keys = {(row[0], row[1]) for row in store.db.execute(
+            "SELECT warc_file, warc_offset FROM fetch_events WHERE warc_file IS NOT NULL")}
+    assert {p.name for p in warc_paths} == registered, "every archive file is registered and vice versa"
+    assert open_files == 0, "every WARC file was closed and indexed"
+    disk = build_index(warc_paths)
+    page_captures = [line for line in disk if not line.original.endswith("robots.txt")]
+    assert len(page_captures) == events, "no response record lacks a fetch event (or the reverse)"
+    assert {(line.filename, line.offset) for line in page_captures} == db_keys
 
 
 def test_cross_process_politeness_holds_with_workers(make_site, tmp_path: Path) -> None:  # noqa: ANN001

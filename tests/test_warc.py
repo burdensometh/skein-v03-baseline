@@ -315,6 +315,125 @@ def test_files_left_open_by_a_killed_writer_are_sealed(tmp_path: Path) -> None:
     assert len(CdxIndex.load(sidecar_path(path)).lines) == 3
 
 
+def _exchange_records(n: int, at: float = T0) -> list[WarcRecord]:
+    return exchange_records(exchange(f"http://www.shop.test/p{n}", body=f"<p>{n}</p>".encode() * 50, at=at),
+                            revisit=None, software="s")
+
+
+def test_rolled_back_records_disappear_and_the_file_stays_usable(tmp_path: Path) -> None:
+    writer = WarcWriter(tmp_path, FakeClock(T0), max_size=10**6, worker="w1")
+    writer.begin()
+    writer.write(_exchange_records(0))
+    (path,) = tmp_path.glob("*.warc.gz")
+    size_after_first = path.stat().st_size
+    assert len(build_index([path])) == 1
+    writer.write(_exchange_records(1, at=T0 + 1))
+    assert path.stat().st_size > size_after_first and len(build_index([path])) == 2
+    writer.rollback()
+    # Nothing was committed: the file created inside the transaction is removed with its sidecar.
+    assert not path.exists() and not sidecar_path(path).exists() and writer.files_written == []
+    # The next transaction starts clean and its records land at offset 0.
+    writer.begin()
+    locations = writer.write(_exchange_records(2, at=T0 + 2))
+    writer.commit()
+    writer.close()
+    (path,) = tmp_path.glob("*.warc.gz")
+    entries = list(WarcReader(path))
+    assert entries[0].record.type == "warcinfo" and locations[0].offset == entries[1].offset
+    assert [line.original for line in build_index([path])] == ["http://www.shop.test/p2"]
+
+
+def test_rollback_truncates_only_the_uncommitted_tail(tmp_path: Path) -> None:
+    writer = WarcWriter(tmp_path, FakeClock(T0), max_size=10**6, worker="w1")
+    writer.begin()
+    writer.write(_exchange_records(0))
+    writer.commit()
+    (path,) = tmp_path.glob("*.warc.gz")
+    committed_size = path.stat().st_size
+    writer.begin()
+    writer.write(_exchange_records(1, at=T0 + 1))
+    assert path.stat().st_size > committed_size
+    writer.rollback()
+    assert path.stat().st_size == committed_size and len(build_index([path])) == 1
+    # The writer is still attached to the same file and appends after the committed bytes.
+    writer.begin()
+    locations = writer.write(_exchange_records(2, at=T0 + 2))
+    writer.commit()
+    writer.close()
+    assert locations[0].filename == path.name and locations[0].offset == committed_size
+    assert sorted(line.original for line in build_index([path])) == [
+        "http://www.shop.test/p0", "http://www.shop.test/p2"]
+    assert WarcReader(path).truncated is None
+
+
+def test_rollback_of_a_rollover_reopens_the_finished_file(tmp_path: Path) -> None:
+    writer = WarcWriter(tmp_path, FakeClock(T0), max_size=2048, worker="w1")
+    writer.begin()
+    first_locations = writer.write(_exchange_records(0))
+    writer.commit()
+    first_file = tmp_path / first_locations[0].filename
+    writer.begin()
+    # Enough exchanges to force at least one rollover inside this transaction.
+    for n in range(1, 8):
+        writer.write(_exchange_records(n, at=T0 + n))
+    assert writer.current is not None and writer.current.name != first_file.name
+    rolled_back = sorted(p.name for p in tmp_path.glob("*.warc.gz"))
+    writer.rollback()
+    # Files created inside the rolled-back transaction disappear; the committed file is active again.
+    assert sorted(p.name for p in tmp_path.glob("*.warc.gz")) == [first_file.name]
+    assert writer.current is not None and writer.current.name == first_file.name
+    writer.begin()
+    locations = writer.write(_exchange_records(9, at=T0 + 9))
+    writer.commit()
+    writer.close()
+    assert locations[0].filename == first_file.name
+    entries = list(WarcReader(first_file))
+    assert [e.record.type for e in entries].count("response") == 2 and WarcReader(first_file).truncated is None
+    assert rolled_back  # the rollover really happened before the rollback
+
+
+def test_repeated_rollbacks_and_rollovers_keep_the_archive_consistent(tmp_path: Path) -> None:
+    writer = WarcWriter(tmp_path, FakeClock(T0), max_size=1500, worker="w1")
+    committed_pages = 0
+    for n in range(30):
+        writer.begin()
+        writer.write(_exchange_records(n, at=T0 + n))
+        if n % 3 == 1:
+            # Roll back a third of the transactions, some of which roll over.
+            writer.rollback()
+            continue
+        writer.commit()
+        committed_pages += 1
+    writer.close()
+    paths = sorted(tmp_path.glob("*.warc.gz"))
+    assert paths
+    for path in paths:
+        reader = WarcReader(path)
+        entries = list(reader)
+        assert entries and reader.truncated is None, f"{path.name} is whole"
+        # Every gzip member sits exactly where the previous one ended.
+        offset = 0
+        for entry in entries:
+            assert entry.offset == offset
+            offset += entry.length
+        assert path.stat().st_size == offset
+    responses = [line for path in paths for line in build_index([path])]
+    assert len(responses) == committed_pages
+    # No sidecar points at a record that is no longer in its file.
+    for path in paths:
+        assert [line.to_line() for line in build_index([path])] == \
+               [line.to_line() for line in CdxIndex.load(sidecar_path(path)).lines]
+
+
+def test_implicit_writes_commit_on_their_own(tmp_path: Path) -> None:
+    writer = WarcWriter(tmp_path, FakeClock(T0), max_size=10**6, worker="w1")
+    writer.write(_exchange_records(0))
+    writer.rollback()  # no open window: nothing to undo, and the call is a no-op
+    writer.close()
+    (path,) = tmp_path.glob("*.warc.gz")
+    assert len(build_index([path])) == 1 and sidecar_path(path).exists()
+
+
 def test_crawl_seals_its_abandoned_file_and_indexes_from_the_database(site: FixtureSite, tmp_path: Path) -> None:
     db = tmp_path / "shop.db"
     project = {"warc": {"enabled": True}}
@@ -335,6 +454,58 @@ def test_crawl_seals_its_abandoned_file_and_indexes_from_the_database(site: Fixt
         assert store.db.execute("SELECT COUNT(*) FROM warc_files WHERE closed_at IS NULL").fetchone()[0] == 0
         revisits = [line for line in database_lines(store.db) if line.mimetype == "warc/revisit"]
     assert revisits, "the second crawl's unchanged pages are revisits"
+
+
+def test_an_unregistered_torn_warc_file_is_sealed_and_registered(site: FixtureSite, tmp_path: Path) -> None:
+    """A file whose registration was lost with a rolled-back transaction still gets recovered.
+
+    This is the half-written file nobody claimed: it sits in the archive
+    directory, has no ``warc_files`` row and ends in a torn gzip member.
+    """
+    db = tmp_path / "shop.db"
+    project = {"warc": {"enabled": True}}
+    crawl(site, db, extract={"items": PRODUCT_ITEMS}, max_depth=1, project=project)
+    archive = tmp_path / "shop.db.warc"
+    (first,) = archive.glob("*.warc.gz")
+    orphan = archive / "skein-20200101000000-99999-ghost.warc.gz"
+    raw = first.read_bytes()
+    # A real crash leaves a half-written final gzip member: a whole member cut
+    # in half, not arbitrary garbage (the reader recognises it as truncated).
+    entries = list(WarcReader(first))
+    last_offset = entries[-1].offset
+    torn_member = raw[last_offset:]
+    orphan.write_bytes(raw[:last_offset] + torn_member[: len(torn_member) // 2])
+    expected = raw[:last_offset]
+    with Store(db) as store:
+        store.db.execute("DELETE FROM warc_files WHERE name = ?", (orphan.name,))
+    crawl(site, db, extract={"items": PRODUCT_ITEMS}, max_depth=1, project=project, incremental={"mode": "full"})
+    assert WarcReader(orphan).truncated is None, "the torn tail was cut"
+    assert orphan.read_bytes() == expected, "only the torn bytes were removed, the old records stay replayable"
+    with Store(db) as store:
+        row = store.db.execute("SELECT closed_at, records, worker_id FROM warc_files WHERE name = ?",
+                               (orphan.name,)).fetchone()
+    assert row is not None and row["closed_at"] is not None and row["worker_id"] is None
+    assert sidecar_path(orphan).exists()
+
+
+def test_a_file_left_open_by_a_dead_worker_is_sealed_on_any_restart(site: FixtureSite, tmp_path: Path) -> None:
+    """Sealing no longer depends on the same worker id coming back (a restarted worker gets a new id)."""
+    db = tmp_path / "shop.db"
+    project = {"warc": {"enabled": True}}
+    crawl(site, db, extract={"items": PRODUCT_ITEMS}, max_depth=1, project=project)
+    archive = tmp_path / "shop.db.warc"
+    (first,) = archive.glob("*.warc.gz")
+    with first.open("ab") as handle:
+        handle.write(b"\x1f\x8b\x08\x00torn")
+    with Store(db) as store:
+        # Simulate a crashed worker whose id is never reused, with an open file.
+        store.db.execute("UPDATE warc_files SET worker_id = ?, closed_at = NULL WHERE name = ?",
+                         ("dead-and-gone-w7", first.name))
+    crawl(site, db, extract={"items": PRODUCT_ITEMS}, max_depth=1, project=project, incremental={"mode": "full"})
+    assert WarcReader(first).truncated is None
+    with Store(db) as store:
+        assert store.db.execute(
+            "SELECT COUNT(*) FROM warc_files WHERE closed_at IS NULL").fetchone()[0] == 0
 
 
 def test_memento_timemap(tmp_path: Path) -> None:

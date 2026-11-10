@@ -128,6 +128,9 @@ class BatchWriter:
         known: list[str] = []
         saved = [(dict(outcome.tally), list(outcome.exchange.metadata) if outcome.exchange else None)
                  for outcome in batch]
+        archive = ctx.archive
+        if archive is not None:
+            archive.begin()
         try:
             with ctx.store.transaction():
                 seq = ctx.checkpoint.next_seq
@@ -138,12 +141,17 @@ class BatchWriter:
                         owners.append(outcome.tally)
                 for tally, written in zip(owners, ctx.store.items.write(pages)):
                     _tally_items(tally, written)
-                if ctx.archive is not None:
-                    ctx.archive.sync()
+                if archive is not None:
+                    archive.sync()
                 deltas = [outcome.tally for outcome in batch] + [{"write_batches": 1}]
                 confirm = any(outcome.event is not None for outcome in batch)
                 entry = ctx.checkpoint.write("batch", deltas=deltas, confirm=confirm)
         except BaseException:
+            # The database transaction is rolling back; cut the records it
+            # appended to WARC files so the archive cannot outlive its fetch
+            # events (the batch is retried afterwards and re-archived once).
+            if archive is not None:
+                archive.rollback()
             for outcome, (tally, metadata) in zip(batch, saved):
                 outcome.tally = tally
                 if outcome.exchange is not None and metadata is not None:
@@ -151,6 +159,8 @@ class BatchWriter:
                 if outcome.event is not None:
                     outcome.event.journal_seq = None
             raise
+        if archive is not None:
+            archive.commit()
         ctx.checkpoint.apply(entry)
         for outcome in batch:
             if outcome.robots_origin is not None:

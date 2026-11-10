@@ -61,6 +61,7 @@ class Coordination:
         spider: str,
         worker_id: str,
         settings: WorkerSettings,
+        on_dead_workers: Callable[[list[str]], None] | None = None,
     ) -> None:
         self.store = store
         self.frontier = frontier
@@ -69,6 +70,7 @@ class Coordination:
         self.spider = spider
         self.worker_id = worker_id
         self.settings = settings
+        self.on_dead_workers = on_dead_workers
         self.stats = CoordinationStats()
         self._last_beat = clock.monotonic()
 
@@ -106,6 +108,10 @@ class Coordination:
                 self.store.workers.finish(worker, "dead", now, None)
             freed = self.scheduler.release_owner(worker)
             log.warning("%s: worker %s is dead; %d host slot(s) freed", self.spider, worker, freed)
+        if report.dead and self.on_dead_workers is not None:
+            # The dead workers will never close their own WARC files; whoever
+            # noticed they are gone seals the files they left open.
+            self.on_dead_workers(list(report.dead))
         reclaimed = self.frontier.reclaim(dead_owners=report.dead)
         report.requeued = len(reclaimed.requeued)
         report.poisoned = reclaimed.poisoned

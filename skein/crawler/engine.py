@@ -50,7 +50,7 @@ from skein.robots.cache import RobotsCache
 from skein.store.rekey import CanonicalRulesError, rekey_spider
 from skein.store.schema_workers import local_worker_id
 from skein.store.sqlite import Store
-from skein.warc.writer import SealReport, WarcFile, WarcWriter, seal
+from skein.warc.writer import WarcFile, WarcWriter, seal
 from skein.workers.coordination import Coordination
 from skein.workers.liveness import HOSTNAME, worker_alive
 
@@ -142,7 +142,8 @@ class Crawler:
         directory = root / spider.name if role == "local" else root / spider.name / "workers" / self.worker_id
         self.checkpoint = Checkpoint(directory, self.clock, checkpoint)
         self.coordination = Coordination(store, self.frontier, self.scheduler, self.clock, spider=spider.name,
-                                         worker_id=self.worker_id, settings=leases)
+                                         worker_id=self.worker_id, settings=leases,
+                                         on_dead_workers=self._on_dead_workers)
         self.requested_mode = mode or spider.incremental.mode
         self.resume_allowed = resume
         self.max_runtime = max_runtime
@@ -476,18 +477,92 @@ class Crawler:
                 on_open=self._warc_opened, on_close=self._warc_closed)
 
     def _seal_abandoned_warcs(self) -> None:
-        """Close the WARC files an earlier, killed incarnation of this worker left open."""
+        """Seal every WARC file in the archive directory that no live writer can still be appending to.
+
+        Covers both the files an earlier incarnation of this worker left open
+        (registered in ``warc_files`` with ``closed_at IS NULL``) and files
+        whose registration was lost with a rolled-back transaction or a
+        crashed process: they exist on disk but have no database row. A torn
+        final gzip member is cut by :func:`~skein.warc.writer.seal`, so a
+        half-written file is made whole and indexed instead of lingering.
+        Files a live peer still holds open are left for that peer's own
+        recovery pass.
+        """
         directory = self.runtime.archive_directory(self.store.path)
-        rows = self.store.db.execute(
-            "SELECT name FROM warc_files WHERE worker_id = ? AND closed_at IS NULL", (self.worker_id,)).fetchall()
-        for (name,) in rows:
+        if not directory.exists():
+            return
+        now = self.clock.time()
+        stale_after = self.coordination.stale_after
+        # A peer counts as live only while its heartbeat is fresh; a worker
+        # that was killed still reads "running" until the next reap, but its
+        # stale heartbeat means nobody is appending to its files anymore.
+        live = {record.id for record in self.store.workers.list(spider=self.spider.name, states=("running",))
+                if record.id != self.worker_id and worker_alive(record, now, stale_after)}
+        registered = {
+            row["name"]: row
+            for row in self.store.db.execute("SELECT * FROM warc_files").fetchall()
+        }
+        on_disk = sorted(path.name for path in directory.iterdir()
+                         if path.name.endswith((".warc.gz", ".warc")))
+        for name in on_disk:
             path = directory / name
-            report = seal(path) if path.exists() else SealReport(0, 0, 0)
-            with self.store.transaction():
-                self.store.db.execute("UPDATE warc_files SET closed_at = ?, records = ?, bytes = ? WHERE name = ?",
-                                      (self.clock.time(), report.records, report.size, name))
-            log.warning("%s: sealed WARC file %s left open by a crash (%d record(s), %d torn byte(s) cut)",
-                        self.spider.name, name, report.records, report.torn_bytes)
+            row = registered.get(name)
+            if row is not None and row["closed_at"] is not None:
+                continue
+            owner = row["worker_id"] if row is not None else None
+            if owner is not None and owner in live:
+                continue
+            if row is None and live and path.stat().st_mtime > now - stale_after:
+                # No database row, but a live peer may be creating it right now
+                # (its registration commits with the first batch). Try again on
+                # the next recovery pass rather than seal a file in use.
+                log.warning("%s: WARC file %s is not registered and peers are still active; leaving it for now",
+                            self.spider.name, name)
+                continue
+            self._seal_warc_file(path, row)
+
+    def _on_dead_workers(self, dead_workers: list[str]) -> None:
+        """Coordination callback: a peer was reaped, so its open archive files are now ownerless."""
+        if self.ctx.archive is None:
+            return
+        try:
+            self._seal_dead_workers_warcs(dead_workers)
+        except Exception:  # noqa: BLE001 - recovery must not take the crawl down
+            log.warning("%s: could not seal the WARC files of dead worker(s) %s",
+                        self.spider.name, ", ".join(dead_workers), exc_info=True)
+
+    def _seal_dead_workers_warcs(self, dead_workers: list[str]) -> None:
+        """Seal the open WARC files of workers a reap just marked dead."""
+        directory = self.runtime.archive_directory(self.store.path)
+        if not directory.exists():
+            return
+        dead = set(dead_workers)
+        rows = self.store.db.execute(
+            "SELECT * FROM warc_files WHERE closed_at IS NULL AND worker_id IS NOT NULL "
+            "AND worker_id IN (%s)" % ",".join("?" * len(dead)), tuple(dead)).fetchall() if dead else []
+        for row in rows:
+            path = directory / row["name"]
+            if path.exists():
+                self._seal_warc_file(path, row)
+
+    def _seal_warc_file(self, path: Path, row: Any) -> None:
+        """Seal one open/orphan WARC file and record (or close) its ``warc_files`` row."""
+        now = self.clock.time()
+        report = seal(path)
+        with self.store.transaction():
+            if row is None:
+                self.store.db.execute(
+                    "INSERT OR IGNORE INTO warc_files (name, directory, worker_id, opened_at, closed_at, "
+                    "records, bytes) VALUES (?, ?, NULL, ?, ?, ?, ?)",
+                    (path.name, str(self.runtime.archive_directory(self.store.path)), path.stat().st_mtime,
+                     now, report.records, report.size))
+            else:
+                self.store.db.execute(
+                    "UPDATE warc_files SET closed_at = ?, records = ?, bytes = ? WHERE name = ?",
+                    (now, report.records, report.size, row["name"]))
+        log.warning("%s: sealed abandoned WARC file %s (%d record(s), %d torn byte(s) cut)%s",
+                    self.spider.name, path.name, report.records, report.torn_bytes,
+                    "" if row is not None else "; it had no database registration")
 
     def _warc_opened(self, file: WarcFile) -> None:
         directory = str(self.runtime.archive_directory(self.store.path))
